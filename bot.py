@@ -290,10 +290,8 @@ def process_result(match_id, hg, ag):
             "away" if pred["away"] > pred["home"] else "draw")
         if predicted == actual:
             p["points"] = p.get("points", 0) + 2
-            p["correct_predictions"] = p.get("correct_predictions", 0) + 1
         if pred["home"] == hg and pred["away"] == ag:
             p["points"] = p.get("points", 0) + 3
-            p["exact_scores"] = p.get("exact_scores", 0) + 1
     match["score"]  = f"{hg}-{ag}"
     match["status"] = STATUS_FINISHED
     matches[match_id] = match
@@ -303,19 +301,25 @@ def process_result(match_id, hg, ag):
 # =====================================================================
 #  TOURNAMENT ENGINE  (real schedule, deterministic bracket)
 # =====================================================================
-def load_schedule():
+def load_schedule(force=False):
     settings = DB.load("settings.json")
+
+    # ALWAYS wipe old fixtures when regenerating
+    if force:
+        DB.save("matches.json", {})
+        settings["match_counter"] = 0
+        DB.save("settings.json", settings)
+
     matches = DB.load("matches.json")
 
-    # only generate once
-    if matches and len(matches) > 0:
+    if matches and len(matches) > 0 and not force:
         return len(matches)
 
     schedule = generate_group_matches(GROUPS)
     created = 0
 
     for dt, grp, home, away, city in schedule:
-        settings["match_counter"] += 1
+        settings["match_counter"] = settings.get("match_counter", 0) + 1
         mid = str(settings["match_counter"])
 
         matches[mid] = {
@@ -337,6 +341,7 @@ def load_schedule():
     DB.save("settings.json", settings)
 
     return created
+
 
 def init_group_tables():
     t = DB.load("tournament.json")
@@ -397,7 +402,7 @@ def create_knockout(teams, stage_code):
     created  = 0
     n = len(teams)
     for i in range(n // 2):
-        settings["match_counter"] += 1
+        settings["match_counter"] = settings.get("match_counter", 0) + 1
         mid = str(settings["match_counter"])
         day = dates[created % len(dates)] if dates else "2026-07-01"
         kickoff = f"{day}T{17 + (created % 3) * 3:02d}:00"
@@ -619,12 +624,19 @@ async def schedule(ctx):
     # Only initialize groups if they don't exist yet
     if not t.get("groups"):
         init_group_tables()
-    count = load_schedule()
+    # Force wipe old matches and reset settings to ensure fresh schedule
+    DB.save("matches.json", {})
+    DB.save("settings.json", {
+        "match_counter": 0,
+        "leaderboard_msg_id": None,
+        "country_messages": []
+    })
+    count = load_schedule(force=True)
     channel = bot.get_channel(WC_CHANNEL_ID)
     if channel:
         await channel.send(
             f"<@&{WC_ROLE_ID}> {WC_EMOJI} The **2026 FIFA World Cup** schedule has been loaded!\n"
-            f"**{count}** group-stage fixtures across **{len(GROUPS)}** groups."
+            f"**{count}** group-stage fixtures."
         )
     await ctx.send(f"{WC_EMOJI} Loaded **{count}** fixtures!")
 
