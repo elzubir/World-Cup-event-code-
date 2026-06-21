@@ -618,4 +618,378 @@ async def countries(ctx):
     settings["country_messages"] = COUNTRY_MSG_IDS
     DB.save("settings.json", settings)
 
-@assistant to=functions.create_or_update_file  summarizing_response_needed=false
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def schedule(ctx):
+    """Load ALL group-stage fixtures from the FIFA schedule."""
+    t = DB.load("tournament.json")
+    # Only initialize groups if they don't exist yet
+    if not t.get("groups"):
+        init_group_tables()
+    # Force wipe old matches and reset settings to ensure fresh schedule
+    DB.save("matches.json", {})
+    DB.save("settings.json", {
+        "match_counter": 0,
+        "leaderboard_msg_id": None,
+        "country_messages": []
+    })
+    count = load_schedule(force=True)
+    channel = bot.get_channel(WC_CHANNEL_ID)
+    if channel:
+        await channel.send(
+            f"<@&{WC_ROLE_ID}> {WC_EMOJI} The **2026 FIFA World Cup** schedule has been loaded!\n"
+            f"**{count}** group-stage fixtures."
+        )
+    await ctx.send(f"{WC_EMOJI} Loaded **{count}** fixtures!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def start(ctx):
+    """Announce the next upcoming match."""
+    mid, match = get_next_match()
+    if not mid:
+        return await ctx.send("No upcoming matches to announce.")
+    await announce_match(mid, match)
+    await ctx.send(f"Announced match #{mid}: {match['home']} vs {match['away']}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def result(ctx, mid: str, score: str):
+    """Record the real result. Usage: .result 1 2-1"""
+    parsed = parse_score(score)
+    if not parsed: return await ctx.send("Invalid format. Use: .result 1 2-1")
+    hg, ag = parsed
+    matches = DB.load("matches.json")
+    match = matches.get(mid)
+    if not match: return await ctx.send(f"Match #{mid} not found.")
+    if match["status"] == STATUS_FINISHED: return await ctx.send("Already finished.")
+    if match.get("score"): return await ctx.send("Score already recorded.")
+    home, away = match["home"], match["away"]
+    process_result(mid, hg, ag)
+    update_group_table(mid, hg, ag)
+    # Archive thread (safe check)
+    if match.get("thread_id"):
+        try:
+            thread = await bot.fetch_channel(int(match["thread_id"]))
+            if isinstance(thread, discord.Thread):
+                try:
+                    await thread.send(f"FULL TIME: **{home} {hg}-{ag} {away}**")
+                except Exception:
+                    pass
+                if not getattr(thread, "locked", False):
+                    try:
+                        await thread.edit(locked=True, archived=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    # AI commentary + headline posted to WC channel
+    channel = bot.get_channel(WC_CHANNEL_ID)
+    commentary = await ai_commentary(home, away, f"{hg}-{ag}")
+    headline   = await ai_headline(home, away, f"{hg}-{ag}")
+    embed = discord.Embed(
+        title=f"{WC_EMOJI}  {headline}",
+        description=commentary,
+        color=0x00FF88,
+    )
+    embed.add_field(
+        name="Result",
+        value=f"{flag_for(home)} **{home}** {hg} - {ag} **{away}** {flag_for(away)}",
+        inline=False,
+    )
+    if channel:
+        await channel.send(embed=embed)
+    else:
+        await ctx.send(embed=embed)
+    # Advance tournament if stage complete
+    advance_tournament()
+    # Update leaderboard
+    await update_leaderboard()
+    # AUTO-ANNOUNCE next match
+    next_mid, next_match = get_next_match()
+    if next_mid:
+        now = datetime.now(timezone.utc)
+        try:
+            ko = datetime.fromisoformat(next_match["kickoff"]).replace(tzinfo=timezone.utc)
+            hours_until = (ko - now).total_seconds() / 3600
+            if hours_until <= 6:
+                await asyncio.sleep(3)
+                await announce_match(next_mid, next_match)
+        except Exception:
+            pass
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def settime(ctx, mid: str, *, dt: str):
+    """Adjust a match kickoff. Usage: .settime 5 2026-06-14T20:00"""
+    matches = DB.load("matches.json")
+    if mid not in matches: return await ctx.send(f"Match #{mid} not found.")
+    matches[mid]["kickoff"] = dt
+    DB.save("matches.json", matches)
+    await ctx.send(f"Match #{mid} kickoff updated to {dt}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def advance(ctx):
+    """Manually advance to the next stage."""
+    if advance_tournament():
+        t = DB.load("tournament.json")
+        await ctx.send(f"{WC_EMOJI} Advanced to **{t['stage']}**!")
+    else:
+        await ctx.send("Cannot advance — current stage not complete.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def winner(ctx):
+    """Announce the champion and award role."""
+    if isinstance(WINNER_ROLE_ID, str) and WINNER_ROLE_ID == "YOUR_ACTUAL_WINNER_ROLE_ID":
+        return await ctx.send("⚠️ WINNER_ROLE_ID not configured. Please set it via environment variable.")
+    matches = DB.load("matches.json")
+    finals = [m for m in matches.values() if m.get("stage")=="FINAL" and m["status"]==STATUS_FINISHED]
+    if not finals: return await ctx.send("The Final has not been played yet.")
+    champ = match_winner(finals[0])
+    if not champ: return await ctx.send("Could not determine champion.")
+    embed = discord.Embed(
+        title=f"{WC_EMOJI}  VTX WORLD CUP 2026 CHAMPION",
+        description=f"**{flag_for(champ)} {champ}** has conquered the World Cup!",
+        color=0xFFD700,
+    )
+    channel = bot.get_channel(WC_CHANNEL_ID)
+    if channel:
+        await channel.send(f"<@&{WC_ROLE_ID}>", embed=embed)
+    players = DB.load("players.json")
+    try:
+        winner_role_id = int(WINNER_ROLE_ID)
+        for guild in bot.guilds:
+            role = guild.get_role(winner_role_id)
+            if not role: continue
+            for member in guild.members:
+                ud = players.get(str(member.id))
+                if ud and ud.get("country") == champ:
+                    try:
+                        await member.add_roles(role)
+                    except Exception:
+                        pass
+                    try: await member.send(f"Congratulations! {champ} won the VTX World Cup 2026!")
+                    except Exception: pass
+    except ValueError:
+        pass
+    t = DB.load("tournament.json")
+    t["stage"] = "FINISHED"; t["champion"] = champ
+    DB.save("tournament.json", t)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def reset(ctx):
+    """Reset all tournament data."""
+    # Stop background tasks
+    autolock.cancel()
+    autoannounce.cancel()
+    autolb.cancel()
+    # Clear data
+    if os.path.exists(DATA_FOLDER): shutil.rmtree(DATA_FOLDER)
+    DB.ensure()
+    global COUNTRY_MSG_IDS, LEADERBOARD_MSG_ID
+    COUNTRY_MSG_IDS = []
+    LEADERBOARD_MSG_ID = None
+    # Restart background tasks
+    if not autolock.is_running():  autolock.start()
+    if not autoannounce.is_running(): autoannounce.start()
+    if not autolb.is_running():    autolb.start()
+    await ctx.send(f"{WC_EMOJI} Tournament **reset**. All data cleared.")
+
+# ── INFO COMMANDS ─────────────────────────────────────────
+@bot.command()
+async def table(ctx, group: str = None):
+    """Show group standings. Usage: .table A"""
+    t = DB.load("tournament.json")
+    if not t.get("groups"): return await ctx.send("Group stage not started.")
+    for g in ([group.upper()] if group else sorted(t["groups"].keys())):
+        if g not in t["groups"]: continue
+        s = group_standings(g)
+        lines = []
+        for i, (team, st) in enumerate(s):
+            lines.append(
+                f"`{i+1}.` {flag_for(team)} **{team}**  "
+                f"P:{st['played']} W:{st['won']} D:{st['drawn']} L:{st['lost']} "
+                f"GD:{st['gd']:+d} **{st['points']}pts**"
+            )
+        embed = discord.Embed(title=f"Group {g}", description="\n".join(lines) or "No data", color=0x00CCFF)
+        await ctx.send(embed=embed)
+
+@bot.command()
+async def stats(ctx, member: discord.Member = None):
+    """Show player stats."""
+    target = member or ctx.author
+    uid = str(target.id)
+    players = DB.load("players.json")
+    p = players.get(uid)
+    if not p: return await ctx.send(f"{target.display_name} is not registered.")
+    country = p.get("country", "Not assigned")
+    embed = discord.Embed(title=f"{flag_for(country)} {target.display_name}", color=0xFFD700)
+    embed.add_field(name="Country", value=country, inline=True)
+    embed.add_field(name="Points",  value=p.get("points",0), inline=True)
+    embed.add_field(name="Correct", value=p.get("correct_predictions",0), inline=True)
+    embed.add_field(name="Exact",   value=p.get("exact_scores",0), inline=True)
+    # AI analysis
+    if country != "Not assigned":
+        analysis = await ai_analysis(country)
+        embed.add_field(name="AI Analysis", value=analysis, inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def lb(ctx):
+    """Show the leaderboard."""
+    players = DB.load("players.json")
+    if not players: return await ctx.send("No players registered.")
+    ranked = sorted(players.items(),
+        key=lambda x: (x[1].get("points",0),x[1].get("exact_scores",0)), reverse=True)
+    medals = ["1st","2nd","3rd"]
+    lines = []
+    for i, (uid, d) in enumerate(ranked[:15]):
+        country = d.get("country","?")
+        rank = medals[i] if i < 3 else f"#{i+1}"
+        lines.append(
+            f"{rank}  {flag_for(country)} **{country}**  <@{uid}>\n"
+            f"   {d.get('points',0)} pts  {d.get('exact_scores',0)} exact  "
+            f"{d.get('correct_predictions',0)} correct"
+        )
+    embed = discord.Embed(
+        title=f"{WC_EMOJI} VTX World Cup 2026  Leaderboard",
+        description="\n\n".join(lines), color=0xFFD700)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def stage(ctx):
+    """Show tournament status."""
+    t = DB.load("tournament.json")
+    ms = DB.load("matches.json")
+    ps = DB.load("players.json")
+    labels = {"registration":"Registration","GROUP":"Group Stage",
+        "R32":"Round of 32","R16":"Round of 16","QF":"Quarter-Finals","SF":"Semi-Finals",
+        "3RD":"Third Place","FINAL":"Final","FINISHED":"Complete"}
+    cur = t.get("stage","registration")
+    embed = discord.Embed(title=f"{WC_EMOJI} Tournament Status", color=0x00FFCC)
+    embed.add_field(name="Stage",    value=labels.get(cur,cur), inline=True)
+    embed.add_field(name="Players",  value=str(len(ps)), inline=True)
+    embed.add_field(name="Champion", value=t.get("champion") or "TBD", inline=True)
+    embed.add_field(name="Open",     value=sum(1 for m in ms.values() if m["status"]==STATUS_OPEN), inline=True)
+    embed.add_field(name="Live",     value=sum(1 for m in ms.values() if m["status"]==STATUS_LOCKED), inline=True)
+    embed.add_field(name="Finished", value=sum(1 for m in ms.values() if m["status"]==STATUS_FINISHED), inline=True)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def help(ctx):
+    """Show all commands."""
+    embed = discord.Embed(title=f"{WC_EMOJI} VTX World Cup 2026  Commands", color=0xFFD700)
+    embed.add_field(name="Registration", value="`.countries` Post flag selection", inline=False)
+    embed.add_field(name="Tournament", value=(
+        "`.schedule` Load real FIFA fixtures\n"
+        "`.start` Announce next match\n"
+        "`.result <id> <score>` Enter real result\n"
+        "`.settime <id> <datetime>` Adjust kickoff\n"
+        "`.advance` Advance stage\n"
+        "`.winner` Announce champion"
+    ), inline=False)
+    embed.add_field(name="Info", value=(
+        "`.table [group]` Standings\n"
+        "`.stats [@user]` Player stats + AI\n"
+        "`.lb` Leaderboard\n"
+        "`.stage` Status"
+    ), inline=False)
+    embed.add_field(name="Admin", value="`.reset` Reset all\n`.help` This message", inline=False)
+    await ctx.send(embed=embed)
+
+# =====================================================================
+#  BACKGROUND AUTOMATION
+# =====================================================================
+@tasks.loop(seconds=30)
+async def autolock():
+    """Lock threads at kickoff."""
+    matches = DB.load("matches.json")
+    now = datetime.now(timezone.utc)
+    changed = False
+    for mid, m in matches.items():
+        if m["status"] != STATUS_OPEN: continue
+        try:
+            ko = datetime.fromisoformat(m["kickoff"]).replace(tzinfo=timezone.utc)
+        except Exception: continue
+        if now >= ko:
+            m["status"] = STATUS_LOCKED; changed = True
+            if m.get("thread_id"):
+                try:
+                    thread = await bot.fetch_channel(m["thread_id"])
+                    try:
+                        await thread.send("Predictions are now **LOCKED**! The match is live!")
+                    except Exception:
+                        pass
+                    if not getattr(thread, "locked", False):
+                        await thread.edit(locked=True)
+                except Exception:
+                    pass
+    if changed: DB.save("matches.json", matches)
+
+@tasks.loop(minutes=5)
+async def autoannounce():
+    """Auto-announce matches 3 hours before kickoff."""
+    matches = DB.load("matches.json")
+    now = datetime.now(timezone.utc)
+    for mid, m in sorted(matches.items(), key=lambda x: _parse_kickoff_for_sort(x[1])):
+        if m["status"] != STATUS_OPEN or m.get("thread_id") or m.get("announced"): continue
+        try:
+            ko = datetime.fromisoformat(m["kickoff"]).replace(tzinfo=timezone.utc)
+        except Exception: continue
+        hours_until = (ko - now).total_seconds() / 3600
+        if 0 < hours_until <= 3:
+            await announce_match(mid, m)
+            await asyncio.sleep(5)
+
+@tasks.loop(minutes=2)
+async def autolb():
+    """Refresh pinned leaderboard."""
+    await update_leaderboard()
+
+async def update_leaderboard():
+    global LEADERBOARD_MSG_ID
+    channel = bot.get_channel(WC_CHANNEL_ID)
+    if not channel: return
+    players = DB.load("players.json")
+    if not players: return
+    ranked = sorted(players.items(),
+        key=lambda x: (x[1].get("points",0),x[1].get("exact_scores",0)), reverse=True)
+    medals = ["1st","2nd","3rd"]
+    lines = []
+    for i, (uid, d) in enumerate(ranked[:10]):
+        country = d.get("country","?")
+        rank = medals[i] if i < 3 else f"#{i+1}"
+        lines.append(
+            f"{rank}  {flag_for(country)} **{country}**  <@{uid}>\n"
+            f"{d.get('points',0)} pts  {d.get('exact_scores',0)} exact  "
+            f"{d.get('correct_predictions',0)} correct"
+        )
+    embed = discord.Embed(
+        title=f"{WC_EMOJI} VTX World Cup 2026  Live Leaderboard",
+        description="\n\n".join(lines) or "No data",
+        color=0xFFD700,
+    )
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    embed.set_footer(text=f"Updated: {ts}")
+    settings = DB.load("settings.json")
+    if LEADERBOARD_MSG_ID:
+        try:
+            msg = await channel.fetch_message(LEADERBOARD_MSG_ID)
+            await msg.edit(embed=embed)
+            return
+        except Exception:
+            pass
+    msg = await channel.send(embed=embed)
+    LEADERBOARD_MSG_ID = msg.id
+    settings["leaderboard_msg_id"] = LEADERBOARD_MSG_ID
+    DB.save("settings.json", settings)
+
+# =====================================================================
+#  RUN
+# =====================================================================
+if __name__ == "__main__":
+    DB.ensure()
+    bot.run(TOKEN)
