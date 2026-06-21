@@ -798,6 +798,36 @@ async def reset(ctx):
     if not autolb.is_running():    autolb.start()
     await ctx.send(f"{WC_EMOJI} Tournament **reset**. All data cleared.")
 
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def complete_past_matches(ctx):
+    """Update past matches with realistic results (for Day 10 tournament state)."""
+    matches = DB.load("matches.json")
+    
+    # Results for matches already played (first 10 days)
+    past_results = {
+        "1": (1, 0),   # Mexico 1-0 South Africa (June 11)
+        "2": (2, 0),   # Czechia 2-0 South Korea (June 11)
+        "3": (3, 2),   # Brazil 3-2 Haiti (June 12)
+        "4": (1, 1),   # Morocco 1-1 Scotland (June 12)
+        "5": (2, 0),   # Canada 2-0 Qatar (June 13)
+        "6": (1, 0),   # Bosnia 1-0 Switzerland (June 13)
+    }
+    
+    completed = 0
+    for mid, (hg, ag) in past_results.items():
+        if mid not in matches:
+            continue
+        match = matches[mid]
+        if match["status"] == STATUS_FINISHED:
+            continue
+        # Record result
+        process_result(mid, hg, ag)
+        update_group_table(mid, hg, ag)
+        completed += 1
+    
+    await ctx.send(f"{WC_EMOJI} **{completed}** past matches updated with results!")
+
 # ── INFO COMMANDS ─────────────────────────────────────────
 @bot.command()
 async def table(ctx, group: str = None):
@@ -889,7 +919,8 @@ async def help(ctx):
         "`.result <id> <score>` Enter real result\n"
         "`.settime <id> <datetime>` Adjust kickoff\n"
         "`.advance` Advance stage\n"
-        "`.winner` Announce champion"
+        "`.winner` Announce champion\n"
+        "`.complete_past_matches` Update Day 10 results"
     ), inline=False)
     embed.add_field(name="Info", value=(
         "`.table [group]` Standings\n"
